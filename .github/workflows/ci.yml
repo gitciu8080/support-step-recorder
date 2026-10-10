@@ -47,6 +47,7 @@ jobs:
           Copy-Item target/release/ssr.exe package/
           Copy-Item README.md package/
           Copy-Item crates/ssr-gui/assets/Droid-LICENSE.txt package/
+          Copy-Item crates/ssr-gui/assets/Droid-NOTICE.txt package/
           Copy-Item docs/release-v0.0.1.md package/RELEASE-NOTES.md
           Compress-Archive -Path package/* -DestinationPath $archive
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
