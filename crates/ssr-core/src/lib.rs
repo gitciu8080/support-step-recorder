@@ -24,6 +24,7 @@ pub mod recorder;
 pub mod screencast;
 pub mod session;
 pub mod text;
+pub mod vision;
 pub mod writer;
 
 pub use i18n::Lang;

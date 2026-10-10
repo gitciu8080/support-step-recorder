@@ -65,7 +65,14 @@ fn read_loop(mut device: Device, tx: Sender<InputEvent>, stop: Arc<AtomicBool>) 
                     if ev.event_type() != EventType::KEY {
                         continue;
                     }
-                    if let Some(out) = translate(ev.code(), ev.value()) {
+                    if let Some(mut out) = translate(ev.code(), ev.value()) {
+                        if let InputEvent::MouseDown { timestamp_ms, .. } = &mut out {
+                            *timestamp_ms = ev
+                                .timestamp()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0);
+                        }
                         if tx.send(out).is_err() {
                             return;
                         }
@@ -85,6 +92,13 @@ fn read_loop(mut device: Device, tx: Sender<InputEvent>, stop: Arc<AtomicBool>) 
 /// `value` : 1 = appui, 0 = relâchement, 2 = répétition automatique.
 fn translate(code: u16, value: i32) -> Option<InputEvent> {
     if let Some(button) = mouse_button(code) {
+        if value == 1 {
+            return Some(InputEvent::MouseDown {
+                button,
+                pos: None,
+                timestamp_ms: crate::session::now_ms(),
+            });
+        }
         // Capture au relâchement, comme le backend device_query.
         return (value == 0).then_some(InputEvent::MouseUp { button, pos: None });
     }
@@ -242,9 +256,16 @@ mod tests {
     }
 
     #[test]
-    fn translate_mouse_only_on_release() {
+    fn translate_mouse_press_and_release() {
         // Appui (value == 1) : rien, on capture au relâchement.
-        assert!(translate(BTN_LEFT, 1).is_none());
+        assert!(matches!(
+            translate(BTN_LEFT, 1),
+            Some(InputEvent::MouseDown {
+                button: Button::Left,
+                pos: None,
+                ..
+            })
+        ));
         // Relâchement (value == 0) : MouseUp sans position (evdev/Wayland).
         assert!(matches!(
             translate(BTN_LEFT, 0),

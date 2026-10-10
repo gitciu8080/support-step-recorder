@@ -1,418 +1,74 @@
-name: CI
+name: Build and release
 
-# Aucun build sur push `main` : le travail arrive en direct sur main, donc un
-# build par commit ne servirait qu'à faire du bruit. Les gates tournent sur PR,
-# sur tag (avant toute signature/publication) et à la demande.
 on:
-  pull_request:
   push:
-    tags: ['v*']          # attrape v1.2.3 ET les pré-releases v1.2.3-rc1
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    runs-on: ubuntu-24.04
+  windows:
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      # Garde-fou posé au tout début du pipeline : le tag doit correspondre à la
-      # version des crates. Sans lui, un tag v0.1.1 a déjà publié une release
-      # GitHub alors que Cargo.toml n'avait pas bougé — crates.io n'a jamais reçu
-      # la version, et comme le publish tolère « already exists », le run est
-      # resté vert et personne n'a rien vu.
-      - name: Check that the tag matches the crate version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          tag="${tag%%-*}"                  # v1.2.3-rc1 → 1.2.3
-          # `cargo pkgid` lit la version que le crate publié utilise vraiment,
-          # sans supposer où se trouve le champ dans Cargo.toml. Les deux crates
-          # héritent de `version.workspace`, donc en contrôler un suffit.
-          crate=$(cargo pkgid -p support-step-recorder-gui)
-          crate="${crate##*[@#]}"
-          if [ "$tag" != "$crate" ]; then
-            echo "::error::tag $GITHUB_REF_NAME mais Cargo.toml en $crate — mets Cargo.toml à jour puis retague"
-            exit 1
-          fi
-          echo "tag $GITHUB_REF_NAME ↔ Cargo.toml $crate : OK"
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libpipewire-0.3-dev libspa-0.2-dev clang \
-            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libdbus-1-dev \
-            libx11-dev libxext-dev libxi-dev libxtst-dev libxrandr-dev libxcursor-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxcb-randr0-dev libxcb-shm0-dev libgbm-dev
-
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Select stable Rust
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - name: Check formatting
         run: cargo fmt --all --check
-
+      - name: Check tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (cargo pkgid -p support-step-recorder-gui) -replace '^.*[@#]', ''
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match Cargo version" }
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  build:
-    needs: lint
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            label: linux-x86_64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            label: linux-aarch64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            label: macos-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            label: macos-x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            label: windows-x86_64
-
-    runs-on: ${{ matrix.os }}
-    name: ${{ matrix.label }}
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace
+      - name: Build Windows executable
+        run: cargo build --release --locked -p support-step-recorder-gui
+      - name: Package Windows executable
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libpipewire-0.3-dev libspa-0.2-dev clang \
-            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libdbus-1-dev \
-            libx11-dev libxext-dev libxi-dev libxtst-dev libxrandr-dev libxcursor-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxcb-randr0-dev libxcb-shm0-dev libgbm-dev
-
-      - name: Build (release)
-        run: cargo build --release --workspace --target ${{ matrix.target }}
-
-      - name: Run tests
-        # Pas de tests sur macOS : le pont Swift de screencapturekit est lié en
-        # double dans le binaire de test (ld: duplicate symbol CoreMediaBridge…).
-        # La logique testée est indépendante de la plateforme et tourne déjà
-        # sous Linux (x86_64 + aarch64) et Windows ; macOS ne fait que `build`.
-        if: runner.os != 'macOS'
-        run: cargo test --workspace --target ${{ matrix.target }}
-
-      # --- Empaquetage (binaires non signés ; la signature est faite plus bas,
-      # dans des jobs dédiés derrière l'environnement `signing`). ---
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
-        run: tar czf ssr-${{ matrix.label }}.tar.gz -C target/${{ matrix.target }}/release ssr
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/ssr.exe -DestinationPath ssr-${{ matrix.label }}.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+          $version = (cargo pkgid -p support-step-recorder-gui) -replace '^.*[@#]', ''
+          $archive = "ssr-v$version-windows-x86_64.zip"
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item target/release/ssr.exe package/
+          Copy-Item README.md package/
+          Copy-Item crates/ssr-gui/assets/Droid-LICENSE.txt package/
+          Copy-Item docs/release-v0.0.1.md package/RELEASE-NOTES.md
+          Compress-Archive -Path package/* -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File "$archive.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ssr-${{ matrix.label }}
-          path: ssr-${{ matrix.label }}.*
-
-  # Signature + notarisation Apple. Derrière `signing` au même titre que Windows :
-  # une signature Developer ID engage l'identité (et donc la réputation) du
-  # propriétaire, elle ne doit jamais partir sans approbation explicite.
-  sign-apple:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-latest
-    environment: signing
-    steps:
-      - name: Download the macOS artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: ssr-macos-*
-          path: dl
-
-      - name: Import Apple Developer ID certificate
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
-          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > $RUNNER_TEMP/certificate.p12
-          security import $RUNNER_TEMP/certificate.p12 \
-            -k "$KEYCHAIN_PATH" \
-            -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-      - name: Sign & notarize the macOS binaries
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          # Soumission + attente, avec timeout et jusqu'à 3 tentatives (5/15/45 min).
-          notarize_once() {
-            local zip="$1" timeout="$2"
-            local output
-            output=$(xcrun notarytool submit "$zip" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_ID_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --verbose 2>&1)
-            echo "$output"
-            local sub_id
-            sub_id=$(echo "$output" | awk '/id:/{print $2; exit}')
-            [ -n "$sub_id" ] || { echo "échec: pas d'ID de soumission"; return 1; }
-            echo "soumis (id: $sub_id)"
-
-            local deadline=$((SECONDS + timeout))
-            while [ $SECONDS -lt $deadline ]; do
-              sleep 30
-              local info
-              info=$(xcrun notarytool info "$sub_id" \
-                --apple-id "$APPLE_ID" \
-                --password "$APPLE_ID_PASSWORD" \
-                --team-id "$APPLE_TEAM_ID" 2>&1) || { echo "erreur réseau, on repoll…"; continue; }
-              local status
-              status=$(echo "$info" | awk '/status:/{print $2; exit}')
-              echo "statut: $status"
-              case "$status" in
-                Accepted) return 0 ;;
-                Invalid|Rejected)
-                  xcrun notarytool log "$sub_id" \
-                    --apple-id "$APPLE_ID" \
-                    --password "$APPLE_ID_PASSWORD" \
-                    --team-id "$APPLE_TEAM_ID" 2>&1 || true
-                  return 1 ;;
-              esac
-            done
-            echo "timeout après $((timeout / 60)) min"
-            return 2
-          }
-
-          notarize() {
-            local zip="$1"
-            local backoffs=(300 900 2700)
-            for i in 0 1 2; do
-              echo "notarisation: tentative $((i + 1))/3"
-              notarize_once "$zip" "${backoffs[$i]}" && return 0
-              local rc=$?
-              [ $rc -eq 2 ] || return $rc   # ne réessaie que sur timeout
-            done
-            return 1
-          }
-
-          for label in macos-arm64 macos-x86_64; do
-            echo "::group::$label"
-            work="$RUNNER_TEMP/$label"
-            mkdir -p "$work"
-            tar xzf "dl/ssr-$label/ssr-$label.tar.gz" -C "$work"
-
-            codesign --force --options runtime \
-              --sign "Developer ID Application: Sylvain Gargasson ($APPLE_TEAM_ID)" \
-              --timestamp "$work/ssr"
-            codesign --verify --strict --verbose=2 "$work/ssr"
-
-            ditto -c -k --keepParent "$work/ssr" "$RUNNER_TEMP/$label.zip"
-            notarize "$RUNNER_TEMP/$label.zip" || exit 1
-
-            tar czf "ssr-$label.tar.gz" -C "$work" ssr
-            echo "::endgroup::"
-          done
-
-      - name: Re-upload the signed macOS arm64 artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ssr-macos-arm64
-          path: ssr-macos-arm64.tar.gz
-          overwrite: true
-
-      - name: Re-upload the signed macOS x86_64 artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ssr-macos-x86_64
-          path: ssr-macos-x86_64.tar.gz
-          overwrite: true
-
-  # Authenticode-sign the Windows binary with ssign — the Linux runner signs it
-  # via Certum (no Windows, no vendor stack). Gated by the `signing` environment
-  # (owner approval); the release below needs it.
-  sign-windows:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    environment: signing
-    steps:
-      - name: Install ssign (prebuilt binary from the latest release)
-        run: |
-          curl -fsSL https://github.com/Le-Syl21/ssign/releases/latest/download/ssign-linux-x86_64.tar.gz | tar xz
-          sudo install -m755 ssign /usr/local/bin/ssign
-
-      - name: Download the Windows artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ssr-windows-x86_64
-          path: dl
-
-      - name: Sign ssr.exe with ssign (via Certum)
-        env:
-          CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
-          CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
-        run: |
-          unzip -o dl/ssr-windows-x86_64.zip -d dl
-          ssign --verbose \
-            -n "support-step-recorder" -u "https://github.com/${{ github.repository }}" \
-            dl/ssr.exe
-          sudo apt-get update -qq && sudo apt-get install -y osslsigncode
-          # Vérifie les faits, pas la présence d'une phrase. « Calculated message
-          # digest » apparaît AUSSI quand le digest ne correspond pas, et ne dit
-          # rien de l'horodatage : ce contrôle laissait donc passer une signature
-          # que Windows aurait rejetée, et des binaires non horodatés — donc
-          # invalides dès l'expiration du certificat.
-          verify_signature() {
-            local out
-            out=$(osslsigncode verify "$1" 2>&1) || true
-            echo "$out"
-            if echo "$out" | grep -q "MISMATCH"; then
-              echo "::error::$1 : digest Authenticode invalide (Windows le verrait comme falsifié)"
-              return 1
-            fi
-            if echo "$out" | grep -q "Timestamp is not available"; then
-              echo "::error::$1 : signature non horodatée (invalide dès l'expiration du certificat)"
-              return 1
-            fi
-            if ! echo "$out" | grep -q "Signature verification: ok"; then
-              echo "::error::$1 : vérification de signature échouée"
-              return 1
-            fi
-          }
-          verify_signature dl/ssr.exe
-          (cd dl && rm -f ssr-windows-x86_64.zip && zip -j ssr-windows-x86_64.zip ssr.exe)
-
-      - name: Re-upload the signed Windows artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ssr-windows-x86_64
-          path: dl/ssr-windows-x86_64.zip
-          overwrite: true
+          name: windows-x86_64
+          path: |
+            ssr-*-windows-x86_64.zip
+            ssr-*-windows-x86_64.zip.sha256
 
   release:
-    needs: [build, sign-windows, sign-apple]
+    needs: windows
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          path: artifacts
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
-        with:
-          generate_release_notes: true
-          # Les tags pré-release (v1.2.3-rc1, -beta…) sont marqués « pre-release »
-          # dans l'UI GitHub — utile pour distribuer un binaire à tester sans en
-          # faire une version officielle.
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: artifacts/**/*
-
-  # Publication crates.io — UNIQUEMENT sur les tags finaux (pas les pré-releases
-  # v*-rc/-beta), car un publish crates.io est définitif (on ne peut que « yank »,
-  # jamais supprimer). C'est l'action la plus irréversible du pipeline : elle passe
-  # donc par son propre environnement d'approbation, distinct de `signing`.
-  publish-crates:
-    needs: [build, release]
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
-    runs-on: ubuntu-24.04
-    environment: crates-io
-    permissions:
-      contents: read
-      id-token: write        # nécessaire pour demander le jeton OIDC à GitHub
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libpipewire-0.3-dev libspa-0.2-dev clang \
-            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libdbus-1-dev \
-            libx11-dev libxext-dev libxi-dev libxtst-dev libxrandr-dev libxcursor-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxcb-randr0-dev libxcb-shm0-dev libgbm-dev
-
-      # Trusted Publishing : aucun secret longue durée. GitHub atteste
-      # cryptographiquement l'identité du workflow (repo + fichier + environnement),
-      # crates.io vérifie cette attestation contre la config enregistrée et émet un
-      # jeton éphémère, révoqué automatiquement en fin de job.
-      - name: Get a temporary crates.io token (OIDC)
-        id: auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
-
-      - name: Publish crates to crates.io
+          name: windows-x86_64
+          path: release-assets
+      - name: Publish release with Windows binaries
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          # Publie en tolérant « already exists » (retag idempotent) et échoue sur
-          # toute autre erreur. Le cœur d'abord ; l'interface en dépend.
-          publish() {
-            if cargo publish -p "$1" 2>&1 | tee /tmp/publish.log; then
-              return 0
-            elif grep -q "already exists" /tmp/publish.log; then
-              echo "$1 : cette version est déjà sur crates.io — rien à faire"
-              return 0
-            else
-              return 1
-            fi
-          }
-          publish support-step-recorder-core || exit 1
-
-          # Attend que crates.io indexe le cœur avant de publier l'interface.
-          for i in $(seq 1 10); do
-            publish support-step-recorder-gui && exit 0
-            echo "index pas encore prêt, nouvelle tentative dans 30 s… ($i/10)"
-            sleep 30
-          done
-          echo "échec de publication de l'interface" >&2
-          exit 1
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "$GITHUB_REF_NAME 中文增强版" --notes-file docs/release-v0.0.1.md

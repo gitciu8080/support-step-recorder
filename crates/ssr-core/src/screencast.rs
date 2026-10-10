@@ -29,6 +29,7 @@ use spa::pod::Pod;
 /// garder du CPU disponible pendant l'enregistrement.
 #[derive(Clone)]
 pub struct Frame {
+    pub timestamp_ms: u128,
     pub width: u32,
     pub height: u32,
     stride: usize,
@@ -128,6 +129,7 @@ fn rb_opaque(format: spa::param::video::VideoFormat) -> Option<(bool, bool)> {
 /// la session du portail.
 pub struct PortalCapture {
     latest: Arc<Mutex<Option<Frame>>>,
+    error: Arc<Mutex<Option<String>>>,
     stop: Option<pw::channel::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -136,6 +138,12 @@ impl PortalCapture {
     /// Négocie le portail (dialogue de consentement) et démarre le flux
     /// PipeWire dans un thread dédié.
     pub fn start() -> io::Result<Self> {
+        Self::start_with_selection(false)
+    }
+
+    pub fn start_with_selection(force_selection: bool) -> io::Result<Self> {
+        let error = Arc::new(Mutex::new(None));
+        let thread_error = error.clone();
         let latest = Arc::new(Mutex::new(None));
         let (tx, rx) = pw::channel::channel::<()>();
 
@@ -143,17 +151,30 @@ impl PortalCapture {
         let thread = std::thread::Builder::new()
             .name("ssr-screencast".into())
             .spawn(move || {
-                if let Err(e) = run(latest_thread, rx) {
+                if let Err(e) = run(latest_thread, rx, force_selection) {
                     eprintln!("ssr: capture portail arrêtée : {e}");
+                    *thread_error.lock().unwrap() = Some(e.to_string());
                 }
             })
             .map_err(io::Error::other)?;
 
         Ok(Self {
             latest,
+            error,
             stop: Some(tx),
             thread: Some(thread),
         })
+    }
+
+    /// True only after the selected source has delivered its first frame.
+    pub fn selection_ready(&self) -> Result<bool, String> {
+        if let Some(error) = self.error.lock().map_err(|e| e.to_string())?.as_ref() {
+            return Err(error.clone());
+        }
+        if self.thread.as_ref().is_some_and(|t| t.is_finished()) {
+            return Err("Screen sharing ended".into());
+        }
+        Ok(self.latest.lock().map_err(|e| e.to_string())?.is_some())
     }
 
     /// Dernière frame livrée par le flux, s'il y en a une.
@@ -168,7 +189,12 @@ impl Drop for PortalCapture {
             let _ = tx.send(()); // demande au mainloop PipeWire de quitter
         }
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            // Negotiation may still be waiting for the desktop picker. Do not
+            // block the GUI while that dialog is open; the queued stop is
+            // consumed as soon as PipeWire starts.
+            if self.latest.lock().map(|f| f.is_some()).unwrap_or(false) || t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -178,16 +204,20 @@ struct UserData {
     format: spa::param::video::VideoInfoRaw,
     latest: Arc<Mutex<Option<Frame>>>,
     /// Dernière frame stockée (throttle : on ne garde qu'une frame ~toutes les
-    /// 100 ms, largement assez pour une capture au clic).
+    /// 16 ms pour suivre les interactions rapides).
     last_store: Option<Instant>,
 }
 
 /// Corps du thread de capture : portail (async) puis boucle PipeWire (bloquante).
-fn run(latest: Arc<Mutex<Option<Frame>>>, stop_rx: pw::channel::Receiver<()>) -> io::Result<()> {
+fn run(
+    latest: Arc<Mutex<Option<Frame>>>,
+    stop_rx: pw::channel::Receiver<()>,
+    force_selection: bool,
+) -> io::Result<()> {
     // 1) Portail ScreenCast. ashpd (feature async-io) pilote l'IO zbus depuis un
     //    réacteur global : on peut donc bloquer ici avec pollster, et la session
     //    reste vivante pendant tout le flux sans runtime à garder actif.
-    let portal = pollster::block_on(negotiate())
+    let portal = pollster::block_on(negotiate(force_selection))
         .map_err(|e| io::Error::other(format!("portail ScreenCast : {e}")))?;
 
     // 2) Flux PipeWire sur le nœud fourni par le portail.
@@ -244,7 +274,7 @@ fn run(latest: Arc<Mutex<Option<Frame>>>, stop_rx: pw::channel::Receiver<()>) ->
             // dernière frame reflète l'état juste avant le clic ; ça suffit et
             // épargne le memcpy.
             if let Some(t) = ud.last_store {
-                if t.elapsed() < Duration::from_millis(200) {
+                if t.elapsed() < Duration::from_millis(16) {
                     return;
                 }
             }
@@ -264,6 +294,7 @@ fn run(latest: Arc<Mutex<Option<Frame>>>, stop_rx: pw::channel::Receiver<()>) ->
             // seulement quand un clic déclenche une capture.
             if let Ok(mut slot) = ud.latest.lock() {
                 *slot = Some(Frame {
+                    timestamp_ms: crate::session::now_ms(),
                     width,
                     height,
                     stride,
@@ -319,16 +350,16 @@ fn run(latest: Arc<Mutex<Option<Frame>>>, stop_rx: pw::channel::Receiver<()>) ->
                 height: 8192
             }
         ),
-        // Framerate volontairement bas : une capture au clic n'a pas besoin de
-        // fluidité, et un flux lent réduit le CPU (côté compositeur et ici).
+        // Request frequent frames so rapid interactions do not all reuse
+        // the same 200 ms-old image. The compositor may negotiate less.
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoFramerate,
             Choice,
             Range,
             Fraction,
-            spa::utils::Fraction { num: 5, denom: 1 },
+            spa::utils::Fraction { num: 60, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction { num: 10, denom: 1 }
+            spa::utils::Fraction { num: 60, denom: 1 }
         ),
     );
     let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
@@ -371,11 +402,15 @@ struct Portal {
 }
 
 /// Dialogue de consentement + ouverture du flux PipeWire.
-async fn negotiate() -> ashpd::Result<Portal> {
+async fn negotiate(force_selection: bool) -> ashpd::Result<Portal> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
 
-    let token = load_restore_token();
+    let token = if force_selection {
+        None
+    } else {
+        load_restore_token()
+    };
     proxy
         .select_sources(
             &session,
@@ -498,12 +533,36 @@ mod tests {
             }
         }
         Frame {
+            timestamp_ms: 0,
             width: w as u32,
             height: h as u32,
             stride,
             format: VideoFormat::BGRx,
             bytes,
         }
+    }
+
+    #[test]
+    fn selection_requires_a_frame_and_rejects_cancelled_or_ended_streams() {
+        let mut capture = PortalCapture {
+            latest: Arc::new(Mutex::new(None)),
+            error: Arc::new(Mutex::new(None)),
+            stop: None,
+            thread: None,
+        };
+        assert_eq!(capture.selection_ready(), Ok(false));
+        *capture.latest.lock().unwrap() = Some(frame_with_block(2, 2, 0, (0, 0, 2, 2)));
+        assert_eq!(capture.selection_ready(), Ok(true));
+        *capture.error.lock().unwrap() = Some("Cancelled".into());
+        assert_eq!(capture.selection_ready(), Err("Cancelled".into()));
+        *capture.error.lock().unwrap() = None;
+        let thread = std::thread::spawn(|| {});
+        while !thread.is_finished() {
+            std::thread::yield_now();
+        }
+        capture.thread = Some(thread);
+        // A stale last frame must not enable Start after sharing ends.
+        assert!(capture.selection_ready().is_err());
     }
 
     #[test]

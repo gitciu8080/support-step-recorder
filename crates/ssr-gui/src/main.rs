@@ -25,7 +25,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Support Step Recorder",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(|cc| {
+            install_chinese_font(&cc.egui_ctx);
+            Ok(Box::new(App::new()))
+        }),
     )
 }
 
@@ -43,12 +46,13 @@ struct StepRow {
     elapsed_ms: u128,
     action: ssr_core::Action,
     window: Option<ssr_core::WindowInfo>,
+    step: ssr_core::Step,
 }
 
 impl StepRow {
     /// Description lisible dans la langue donnée.
     fn description(&self, lang: Lang) -> String {
-        ssr_core::Step::build_description(&self.action, self.window.as_ref(), lang)
+        self.step.display_description(lang)
     }
 }
 
@@ -61,6 +65,9 @@ struct Snapshot {
 
 struct App {
     base_dir: PathBuf,
+    screen: Option<Arc<ssr_core::capture::Screen>>,
+    screen_ready: bool,
+    selecting_screen: bool,
     recorder: Option<Recorder>,
     /// Dernière session terminée, conservée pour la revue et l'export.
     last: Option<Arc<Mutex<Session>>>,
@@ -81,12 +88,24 @@ struct App {
     confirm_discard: bool,
     /// Langue de l'interface (et des rapports générés).
     lang: Lang,
+    analysis: Option<Receiver<Result<usize, String>>>,
+    cancel_analysis: Arc<std::sync::atomic::AtomicBool>,
+    original_size: bool,
+    show_before: bool,
+    edit_text: String,
+    edit_index: Option<usize>,
+    screenshot_quality: f32,
+    vision_config: ssr_core::vision::VisionConfig,
+    auto_analyze: bool,
 }
 
 impl App {
     fn new() -> Self {
         let lang = Lang::detect();
-        Self {
+        let mut app = Self {
+            screen: None,
+            screen_ready: false,
+            selecting_screen: false,
             // Les captures sont volatiles : elles vivent dans un dossier temporaire
             // jusqu'à ce que l'utilisateur choisisse où enregistrer le rapport.
             base_dir: std::env::temp_dir().join("support-step-recorder"),
@@ -101,6 +120,80 @@ impl App {
             pending_save: None,
             confirm_discard: false,
             lang,
+            analysis: None,
+            cancel_analysis: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            original_size: false,
+            show_before: false,
+            edit_text: String::new(),
+            edit_index: None,
+            screenshot_quality: 100.0,
+            auto_analyze: ssr_core::vision::VisionConfig::load().is_ok(),
+            vision_config: ssr_core::vision::VisionConfig::load().unwrap_or(
+                ssr_core::vision::VisionConfig {
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    model: "Qwen3.6-35B-A3B".into(),
+                    timeout_seconds: 120,
+                },
+            ),
+        };
+        app.select_screen();
+        app
+    }
+
+    fn select_screen(&mut self) {
+        self.screen = None;
+        self.screen_ready = false;
+        self.selecting_screen = true;
+        self.status = self
+            .t(
+                "Choisissez une fenêtre ou un écran…",
+                "Choose a window or screen…",
+            )
+            .into();
+        match ssr_core::capture::Screen::prepare_selection() {
+            Ok(screen) => self.screen = Some(Arc::new(screen)),
+            Err(error) => {
+                self.selecting_screen = false;
+                self.status = format!(
+                    "{} {error}",
+                    self.t(
+                        "Sélection annulée ou indisponible :",
+                        "Selection cancelled or unavailable:"
+                    )
+                );
+            }
+        }
+    }
+
+    fn poll_screen(&mut self) {
+        let Some(screen) = &self.screen else { return };
+        match screen.selection_ready() {
+            Ok(true) => {
+                if self.selecting_screen {
+                    self.status = self
+                        .t(
+                            "Zone sélectionnée. Prêt à enregistrer.",
+                            "Area selected. Ready to record.",
+                        )
+                        .into();
+                }
+                self.screen_ready = true;
+                self.selecting_screen = false;
+            }
+            Ok(false) => self.screen_ready = false,
+            Err(error) => {
+                self.screen_ready = false;
+                self.selecting_screen = false;
+                self.screen = None;
+                self.status = format!(
+                    "{} {error}",
+                    self.t(
+                        "Sélection annulée ou indisponible :",
+                        "Selection cancelled or unavailable:"
+                    )
+                );
+            }
         }
     }
 
@@ -133,17 +226,22 @@ impl App {
     fn start(&mut self) {
         // Purge le dossier temporaire de la session précédente (les captures
         // n'ont d'intérêt qu'une fois le rapport enregistré par l'utilisateur).
+        let Some(screen) = self.screen.clone().filter(|_| self.screen_ready) else {
+            return;
+        };
         self.cleanup_previous_temp();
 
         let name = format!("session-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
         let dir = self.base_dir.join(name);
-        match Recorder::start(dir.clone(), self.progress.clone(), self.lang) {
+        match Recorder::start_with_screen(
+            dir.clone(),
+            self.progress.clone(),
+            self.lang,
+            self.screenshot_quality,
+            screen,
+        ) {
             Ok(rec) => {
-                self.status = format!(
-                    "{} [{}]…",
-                    self.t("Enregistrement", "Recording"),
-                    rec.backend_name()
-                );
+                self.status = format!("{}…", self.t("Enregistrement", "Recording"));
                 self.recorder = Some(rec);
                 self.last = None;
                 self.selected = None;
@@ -167,6 +265,12 @@ impl App {
             self.last = Some(session.clone());
             // Enchaîne directement sur le choix de la destination.
             self.pending_save = Some(session);
+            if self.auto_analyze {
+                self.begin_analysis();
+                if self.analysis.is_some() {
+                    return;
+                }
+            }
             self.begin_save();
         }
     }
@@ -254,6 +358,57 @@ impl App {
         }
     }
 
+    fn begin_analysis(&mut self) {
+        let Some(session) = self.last.clone() else {
+            return;
+        };
+        let config = match ssr_core::vision::VisionConfig::load() {
+            Ok(config) => config,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.cancel_analysis = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.cancel_analysis.clone();
+        let progress = self.progress.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                ssr_core::vision::analyze_session(session, config, cancel, progress.clone());
+            progress.clear();
+            let _ = tx.send(result);
+        });
+        self.analysis = Some(rx);
+        self.status = "正在生成中文步骤描述…".into();
+    }
+
+    fn poll_analysis(&mut self) {
+        let Some(rx) = &self.analysis else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.status = match result {
+                    Ok(count) => format!("本次已生成 {count} 条描述；可检查、修改并重新导出。"),
+                    Err(error) => error,
+                };
+                self.analysis = None;
+                if self.pending_save.is_some() {
+                    self.begin_save();
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status = "视觉分析已中断".into();
+                self.analysis = None;
+                if self.pending_save.is_some() {
+                    self.begin_save();
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     /// Charge (et met en cache) la texture d'une capture.
     fn texture(
         &mut self,
@@ -276,14 +431,21 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.poll_screen();
         self.poll_export();
+        self.poll_analysis();
 
         // Action longue en cours (capture, sauvegarde, HTML, compression…).
         let activity = self.progress.get();
 
         // Tant qu'un travail tourne (enregistrement, action en cours, export),
         // les données évoluent depuis d'autres threads : rafraîchir régulièrement.
-        if self.is_recording() || activity.is_some() || self.export.is_some() {
+        if self.selecting_screen
+            || self.is_recording()
+            || activity.is_some()
+            || self.export.is_some()
+            || self.analysis.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
@@ -300,23 +462,151 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::RED, self.t("enregistrement", "recording"));
                 } else {
                     paint_dot(ui, egui::Color32::RED);
-                    if ui.button(self.t("Démarrer", "Start")).clicked() {
+                    if ui
+                        .add_enabled(
+                            self.screen_ready && self.analysis.is_none() && self.export.is_none(),
+                            egui::Button::new(self.t("Démarrer", "Start")),
+                        )
+                        .clicked()
+                    {
                         self.start();
                     }
+                }
+
+                if !self.is_recording()
+                    && ui
+                        .add_enabled(
+                            !self.selecting_screen
+                                && self.analysis.is_none()
+                                && self.export.is_none(),
+                            egui::Button::new(self.t("Choisir la zone", "Select recording area")),
+                        )
+                        .clicked()
+                {
+                    self.select_screen();
                 }
 
                 // À droite : bouton de langue (FR/EN) puis sélecteur de thème.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     theme_toggle(ui, self.lang);
-                    // Bouton de langue : affiche la langue vers laquelle basculer.
-                    let other = self.lang.toggled();
-                    let label = other.pick("FR", "EN");
-                    let tip = self.t("Passer en anglais", "Switch to French");
-                    if ui.button(label).on_hover_text(tip).clicked() {
-                        self.set_lang(other);
+                    let mut selected_lang = self.lang;
+                    egui::ComboBox::from_id_salt("language")
+                        .selected_text(match self.lang {
+                            Lang::ZhCn => "简体中文",
+                            Lang::En => "English",
+                            Lang::Fr => "Français",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut selected_lang, Lang::ZhCn, "简体中文");
+                            ui.selectable_value(&mut selected_lang, Lang::En, "English");
+                            ui.selectable_value(&mut selected_lang, Lang::Fr, "Français");
+                        });
+                    if selected_lang != self.lang {
+                        self.set_lang(selected_lang);
                     }
                 });
             });
+            if !self.is_recording() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.auto_analyze,
+                        self.lang
+                            .pick("Décrire après l’arrêt", "Describe steps after stopping"),
+                    )
+                    .on_hover_text(self.lang.pick(
+                        "Envoyer les captures au MI50 configuré",
+                        "Send screenshots to the configured MI50 for analysis",
+                    ));
+                    ui.label(self.t("Qualité des captures", "Screenshot quality"));
+                    egui::ComboBox::from_id_salt("screenshot-quality")
+                        .selected_text(match self.screenshot_quality as u32 {
+                            100 => self.t("Sans perte", "Lossless"),
+                            90 => self.t("Haute qualité", "High quality"),
+                            _ => self.t("Compact", "Compact"),
+                        })
+                        .show_ui(ui, |ui| {
+                            for (quality, label) in [
+                                (100.0, self.t("Sans perte", "Lossless")),
+                                (90.0, self.t("Haute qualité", "High quality")),
+                                (70.0, self.t("Compact", "Compact")),
+                            ] {
+                                ui.selectable_value(&mut self.screenshot_quality, quality, label);
+                            }
+                        });
+                });
+            }
+            if !self.is_recording() && self.analysis.is_none() && self.export.is_none() {
+                ui.collapsing(self.t("Réglages vision", "Vision settings"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("API URL");
+                        ui.text_edit_singleline(&mut self.vision_config.base_url);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Model");
+                        ui.text_edit_singleline(&mut self.vision_config.model);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("API Key");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.vision_config.api_key)
+                                .password(true),
+                        );
+                    });
+                    ui.label(self.t(
+                        "Envoyer les captures au MI50 configuré",
+                        "Send screenshots to the configured MI50 for analysis",
+                    ));
+                    if ui
+                        .button(self.t("Enregistrer les réglages", "Save settings"))
+                        .clicked()
+                    {
+                        self.status = match self
+                            .vision_config
+                            .save()
+                            .and_then(|()| ssr_core::vision::VisionConfig::load().map(|_| ()))
+                        {
+                            Ok(()) => "视觉模型设置已保存。".into(),
+                            Err(error) => error,
+                        };
+                    }
+                });
+            }
+            if !self.is_recording() && self.last.is_some() {
+                ui.horizontal(|ui| {
+                    if self.analysis.is_some() {
+                        if ui
+                            .button(self.t("Annuler l’analyse", "Cancel analysis"))
+                            .clicked()
+                        {
+                            self.cancel_analysis
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.status = "正在取消，将保留已完成的描述…".into();
+                        }
+                    } else if ui
+                        .add_enabled(
+                            self.export.is_none(),
+                            egui::Button::new(self.t("Analyser avec MI50", "Analyze with MI50")),
+                        )
+                        .on_hover_text(self.t(
+                            "Envoyer les captures au MI50 configuré",
+                            "Send screenshots to the configured MI50 for analysis",
+                        ))
+                        .clicked()
+                    {
+                        self.begin_analysis();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.analysis.is_none() && self.export.is_none(),
+                            egui::Button::new(self.t("Exporter à nouveau", "Save again")),
+                        )
+                        .clicked()
+                    {
+                        self.pending_save = self.last.clone();
+                        self.begin_save();
+                    }
+                });
+            }
             ui.add_space(4.0);
         });
 
@@ -355,6 +645,7 @@ impl eframe::App for App {
                         elapsed_ms: st.elapsed_ms,
                         action: st.action.clone(),
                         window: st.window.clone(),
+                        step: st.clone(),
                     })
                     .collect();
                 self.snapshot = Some(Snapshot {
@@ -444,16 +735,90 @@ impl eframe::App for App {
                 row.description(lang)
             ));
             step_metadata(ui, row, lang);
+            if let Some(error) = &row.step.capture_error {
+                ui.colored_label(egui::Color32::DARK_RED, error);
+            }
+            if let Some(ai) = &row.step.analysis {
+                if let Some(error) = &ai.error {
+                    ui.colored_label(egui::Color32::DARK_RED, error);
+                }
+                if !ai.visible_result.is_empty() {
+                    ui.label(format!("可见结果：{}", ai.visible_result));
+                }
+                if !ai.uncertainty.is_empty() {
+                    ui.weak(format!("待确认：{}", ai.uncertainty));
+                }
+                if ai.status == "complete" {
+                    ui.weak(format!(
+                        "{} · {}",
+                        lang.pick("Description proposée par IA", "AI suggested description"),
+                        ai.model
+                    ));
+                }
+            }
+            if !self.is_recording() && self.analysis.is_none() && self.export.is_none() {
+                ui.collapsing(
+                    lang.pick("Modifier la description", "Edit description"),
+                    |ui| {
+                        if self.edit_index != Some(row.index) {
+                            self.edit_text = row.description(lang);
+                            self.edit_index = Some(row.index);
+                        }
+                        ui.text_edit_multiline(&mut self.edit_text);
+                        ui.horizontal(|ui| {
+                            let apply = ui.button(lang.pick("Appliquer", "Apply")).clicked();
+                            let clear = ui
+                                .button(lang.pick("Effacer la modification", "Clear edit"))
+                                .clicked();
+                            if apply || clear {
+                                if let Some(session) = self.current() {
+                                    if let Ok(mut s) = session.lock() {
+                                        if let Some(step) =
+                                            s.steps.iter_mut().find(|st| st.index == row.index)
+                                        {
+                                            step.edited_description =
+                                                if clear || self.edit_text.trim().is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(self.edit_text.clone())
+                                                };
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    },
+                );
+            }
             ui.separator();
-            match &row.screenshot {
+            if row.step.before_screenshot.is_some() {
+                ui.checkbox(
+                    &mut self.show_before,
+                    lang.pick("Image avant l’action", "Before action frame"),
+                );
+            }
+            let shown = if self.show_before {
+                row.step
+                    .before_screenshot
+                    .as_ref()
+                    .or(row.screenshot.as_ref())
+            } else {
+                row.screenshot.as_ref()
+            };
+            match shown {
                 Some(name) => {
                     if let Some(tex) = self.texture(&ctx, &snap.dir, name) {
+                        ui.checkbox(
+                            &mut self.original_size,
+                            lang.pick("Taille originale", "Original size"),
+                        );
                         egui::ScrollArea::both().show(ui, |ui| {
-                            ui.add(
-                                egui::Image::new(&tex)
-                                    .max_width(ui.available_width())
-                                    .maintain_aspect_ratio(true),
-                            );
+                            let image = egui::Image::new(&tex).maintain_aspect_ratio(true);
+                            if self.original_size {
+                                ui.add(image.fit_to_exact_size(tex.size_vec2()));
+                            } else {
+                                ui.add(image.max_width(ui.available_width()));
+                            }
                         });
                     } else {
                         ui.label(self.t("Capture introuvable.", "Screenshot not found."));
@@ -532,15 +897,34 @@ fn step_metadata(ui: &mut egui::Ui, row: &StepRow, lang: Lang) {
                 button.label(lang)
             ));
         }
+        ssr_core::Action::TextUnconfirmed => {
+            ui.label(lang.pick("Saisie non confirmée", "Unconfirmed text input"));
+        }
         ssr_core::Action::Text { content } => {
             let shown = content.replace('\n', "⏎");
             ui.label(match lang {
                 Lang::Fr => format!("Action : saisie « {shown} »"),
                 Lang::En => format!("Action: typed “{shown}”"),
+                Lang::ZhCn => format!("文字内容：“{shown}”"),
             });
         }
     }
 
+    if let Some(source) = row.step.text_source {
+        let label = match source {
+            ssr_core::model::TextSource::InputMethodCommit => {
+                lang.pick("Source : texte validé", "Source: input method commit")
+            }
+            ssr_core::model::TextSource::TextField
+            | ssr_core::model::TextSource::AccessibleField => {
+                lang.pick("Source : champ de texte", "Source: text field")
+            }
+            ssr_core::model::TextSource::KeyboardEstimate => {
+                lang.pick("Source : estimation clavier", "Source: keyboard estimate")
+            }
+        };
+        ui.weak(label);
+    }
     // Fenêtre active (souvent inconnue sous Wayland).
     let title = row
         .window
@@ -665,5 +1049,30 @@ fn theme_toggle(ui: &mut egui::Ui, lang: Lang) {
             System => Light,
         };
         ui.ctx().set_theme(next);
+    }
+}
+
+fn install_chinese_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "droid-cjk".into(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/DroidSansFallbackFull.ttf"
+        ))),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("droid-cjk".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.cancel_analysis
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

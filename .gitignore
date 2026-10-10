@@ -13,3 +13,9 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# Local recordings and private model settings
+/session-*
+vision.json
+.env
+.env.*

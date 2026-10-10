@@ -45,15 +45,20 @@ pub fn capture_window(window: &Window) -> Option<RgbaImage> {
 pub fn encode_webp(image: &RgbaImage, quality: f32) -> Vec<u8> {
     let encoder = Encoder::from_rgba(image.as_raw(), image.width(), image.height());
     let Ok(mut config) = WebPConfig::new() else {
-        return encoder.encode(quality).to_vec(); // repli si config indisponible
+        return if quality >= 100.0 {
+            encoder.encode_lossless().to_vec()
+        } else {
+            encoder.encode(quality).to_vec()
+        };
     };
-    config.lossless = 0;
+    config.lossless = i32::from(quality >= 100.0);
     config.alpha_compression = 1;
     config.quality = quality;
     // 0 = le plus rapide (CPU mini) … 6 = le plus lent (fichier plus petit).
     config.method = 1;
     match encoder.encode_advanced(&config) {
         Ok(mem) => mem.to_vec(),
+        Err(_) if quality >= 100.0 => encoder.encode_lossless().to_vec(),
         Err(_) => encoder.encode(quality).to_vec(),
     }
 }
@@ -111,6 +116,23 @@ impl Screen {
         Screen::Xcap
     }
 
+    /// Ask for a fresh source on Wayland without falling back after cancellation.
+    pub fn prepare_selection() -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        if crate::input::is_wayland() {
+            return crate::screencast::PortalCapture::start_with_selection(true).map(Self::Portal);
+        }
+        Ok(Self::Xcap)
+    }
+
+    pub fn selection_ready(&self) -> Result<bool, String> {
+        match self {
+            Self::Xcap => Ok(true),
+            #[cfg(target_os = "linux")]
+            Self::Portal(portal) => portal.selection_ready(),
+        }
+    }
+
     /// Capture adaptée à un clic. Renvoie **les pixels bruts** (non encodés) et
     /// l'info fenêtre éventuelle — le travail lourd (conversion/encodage/écriture)
     /// est délégué au [`crate::writer::Writer`]. `None` si rien à capturer.
@@ -119,11 +141,11 @@ impl Screen {
     /// l'écran (xcap) ou le snapshot de la dernière frame (portail).
     pub fn capture_for_click(
         &self,
-        pos: Option<(i32, i32)>,
+        _pos: Option<(i32, i32)>,
     ) -> Option<(Pixels, Option<WindowInfo>)> {
         match self {
             Screen::Xcap => {
-                let (image, info) = capture_for_click_native(pos)?;
+                let (image, info) = capture_for_click_native(None)?;
                 Some((Pixels::Rgba(image), info))
             }
             #[cfg(target_os = "linux")]

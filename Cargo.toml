@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/ssr-core", "crates/ssr-gui"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.0.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Le-Syl21/support-step-recorder"
+repository = "https://github.com/gitciu8080/support-step-recorder"
 
 [workspace.dependencies]
 device_query = "4.0"

@@ -24,6 +24,15 @@ impl InputBackend for DeviceQueryBackend {
         let mut guards: Vec<Box<dyn std::any::Any + Send + Sync>> = Vec::new();
 
         let t = tx.clone();
+        guards.push(Box::new(handler.on_mouse_down(move |button| {
+            let _ = t.send(InputEvent::MouseDown {
+                button: from_dq_button(*button),
+                pos: Some(DeviceState::new().get_mouse().coords),
+                timestamp_ms: crate::session::now_ms(),
+            });
+        })));
+
+        let t = tx.clone();
         guards.push(Box::new(handler.on_mouse_up(move |button| {
             let pos = Some(DeviceState::new().get_mouse().coords);
             let _ = t.send(InputEvent::MouseUp {

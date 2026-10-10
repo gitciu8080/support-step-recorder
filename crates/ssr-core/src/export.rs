@@ -14,7 +14,16 @@ use crate::session::Session;
 
 /// Écrit `steps.json` et `report.html` (dans la langue `lang`) dans le dossier.
 pub fn write_report(session: &Session, lang: Lang) -> io::Result<()> {
-    let json = serde_json::to_string_pretty(&session.steps).map_err(io::Error::other)?;
+    let steps: Vec<_> = session
+        .steps
+        .iter()
+        .map(|step| {
+            let mut exported = step.clone();
+            exported.description = step.display_description(lang);
+            exported
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&steps).map_err(io::Error::other)?;
     fs::write(session.dir.join("steps.json"), json)?;
     fs::write(session.dir.join("report.html"), render_html(session, lang))?;
     Ok(())
@@ -34,19 +43,49 @@ pub fn export_zip(
     write_report(session, lang)?;
 
     progress.set(lang.msg_compressing());
-    let file = File::create(zip_path)?;
-    let mut zip = ZipWriter::new(file);
-    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-    add_file(&mut zip, session, "report.html", opts)?;
-    add_file(&mut zip, session, "steps.json", opts)?;
-    for step in &session.steps {
-        if let Some(name) = &step.screenshot {
-            add_file(&mut zip, session, name, opts)?;
+    let parent = zip_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    static EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".ssr-export-{}-{nonce}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let result: io::Result<()> = (|| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let mut zip = ZipWriter::new(file);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        add_file(&mut zip, session, "report.html", opts)?;
+        add_file(&mut zip, session, "steps.json", opts)?;
+        let mut added = std::collections::HashSet::new();
+        for step in &session.steps {
+            for name in [step.before_screenshot.as_ref(), step.screenshot.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if added.insert(name) {
+                    add_file(&mut zip, session, name, opts)?;
+                }
+            }
         }
+        zip.finish().map_err(io::Error::other)?.sync_all()?;
+        std::fs::rename(&temporary, zip_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-
-    zip.finish().map_err(io::Error::other)?;
+    result?;
     Ok(())
 }
 
@@ -58,7 +97,10 @@ fn add_file(
 ) -> io::Result<()> {
     let path = session.dir.join(name);
     if !path.exists() {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Missing report file: {name}"),
+        ));
     }
     let data = fs::read(&path)?;
     zip.start_file(name, opts).map_err(io::Error::other)?;
@@ -83,6 +125,7 @@ pub fn render_html(session: &Session, lang: Lang) -> String {
     let t_prev = lang.pick("Précédent", "Previous");
     let t_next = lang.pick("Suivant", "Next");
     let t_step = lang.pick("Étape", "Step");
+    let t_enlarged = lang.pick("Capture agrandie", "Enlarged screenshot");
 
     format!(
         r#"<!DOCTYPE html>
@@ -149,7 +192,7 @@ pub fn render_html(session: &Session, lang: Lang) -> String {
 <main id="steps">
 {steps_html}
 </main>
-<div id="lightbox" onclick="this.classList.remove('open')"><img alt="capture agrandie"></div>
+<div id="lightbox" onclick="this.classList.remove('open')"><img alt="{t_enlarged}"></div>
 <script>
   // Visionneuse : clic sur une capture → plein écran ; clic ou Échap → fermer.
   function zoom(img) {{
@@ -192,12 +235,12 @@ pub fn render_html(session: &Session, lang: Lang) -> String {
 }
 
 fn render_step(step: &Step, lang: Lang) -> String {
-    let typed = matches!(step.action, Action::Text { .. });
+    let typed = matches!(step.action, Action::Text { .. } | Action::TextUnconfirmed);
     let class = if typed { "step typed" } else { "step" };
     let elapsed = format!("{:.1}s", step.elapsed_ms as f64 / 1000.0);
     // Description reconstruite dans la langue du rapport (indépendante de la
     // langue d'enregistrement).
-    let desc = Step::build_description(&step.action, step.window.as_ref(), lang);
+    let desc = step.display_description(lang);
 
     let ctx = step
         .window
@@ -218,17 +261,56 @@ fn render_step(step: &Step, lang: Lang) -> String {
         .as_ref()
         .map(|name| {
             format!(
-                "<img src=\"{}\" alt=\"capture étape {}\" onclick=\"zoom(this)\">",
+                "<img src=\"{}\" alt=\"{} {}\" onclick=\"zoom(this)\">",
                 escape(name),
+                lang.pick("Capture", "Screenshot"),
                 step.index
             )
         })
         .unwrap_or_default();
 
+    let before_image = step.before_screenshot.as_ref().map(|name| format!("<details><summary>{}</summary><img src=\"{}\" alt=\"{}\" onclick=\"zoom(this)\"></details>",
+        lang.pick("Image avant l’action", "Before action frame"), escape(name), lang.pick("Image avant l’action", "Before action frame"))).unwrap_or_default();
+    let mut evidence = String::new();
+    if let Some(error) = &step.capture_error {
+        evidence.push_str(&format!("<p>{}</p>", escape(error)));
+    }
+    if let Some(ai) = &step.analysis {
+        evidence.push_str(&format!(
+            "<p class=\"ctx\">{} · {}</p>",
+            lang.pick("Description proposée par IA", "AI suggested description"),
+            escape(&ai.model)
+        ));
+        for (label, value) in [
+            (
+                lang.pick("Résultat visible", "Visible result"),
+                &ai.visible_result,
+            ),
+            (lang.pick("À vérifier", "Uncertainty"), &ai.uncertainty),
+        ] {
+            if !value.is_empty() {
+                evidence.push_str(&format!("<p>{}: {}</p>", label, escape(value)));
+            }
+        }
+        if let Some(error) = &ai.error {
+            evidence.push_str(&format!("<p>{}</p>", escape(error)));
+        }
+    }
+    let raw = Step::build_description(&step.action, step.window.as_ref(), lang);
+    if raw != desc {
+        evidence.push_str(&format!(
+            "<details><summary>{}</summary>{}</details>",
+            lang.pick("Événement original", "Original event"),
+            escape(&raw)
+        ));
+    }
+
     format!(
         r#"<section class="{class}">
   <h2><span class="num">{idx}</span>{desc}</h2>
   <p class="ctx">⏱ {elapsed} — {ctx}</p>
+  {evidence}
+  {before_image}
   {image}
 </section>
 "#,

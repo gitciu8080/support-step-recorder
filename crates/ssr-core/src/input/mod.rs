@@ -8,6 +8,10 @@ use std::any::Any;
 use std::io;
 use std::sync::mpsc::Sender;
 
+#[cfg(target_os = "linux")]
+pub mod a11y;
+#[cfg(target_os = "linux")]
+pub mod committed;
 pub mod devicequery;
 #[cfg(target_os = "linux")]
 pub mod evdev_backend;
@@ -29,8 +33,12 @@ pub enum Button {
 impl Button {
     /// Libellé du bouton dans la langue donnée.
     pub fn label(self, lang: crate::i18n::Lang) -> String {
-        use crate::i18n::Lang::{En, Fr};
+        use crate::i18n::Lang::{En, Fr, ZhCn};
         match (lang, self) {
+            (ZhCn, Button::Left) => "左键".into(),
+            (ZhCn, Button::Middle) => "中键".into(),
+            (ZhCn, Button::Right) => "右键".into(),
+            (ZhCn, Button::Other(n)) => format!("按钮 {n}"),
             (Fr, Button::Left) => "gauche".into(),
             (Fr, Button::Middle) => "milieu".into(),
             (Fr, Button::Right) => "droit".into(),
@@ -46,6 +54,11 @@ impl Button {
 /// Événement d'entrée normalisé, indépendant du backend.
 #[derive(Clone, Debug)]
 pub enum InputEvent {
+    MouseDown {
+        button: Button,
+        pos: Option<(i32, i32)>,
+        timestamp_ms: u128,
+    },
     /// Clic relâché. `pos` = position absolue du curseur si le backend la connaît
     /// (X11/Windows/macOS), `None` sur Wayland/evdev.
     MouseUp {
@@ -54,6 +67,8 @@ pub enum InputEvent {
     },
     KeyDown(Keycode),
     KeyUp(Keycode),
+    #[cfg(target_os = "linux")]
+    Text(committed::TextObservation),
 }
 
 /// Garde de capture : la capture s'arrête quand cette poignée est détruite.

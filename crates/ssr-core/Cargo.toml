@@ -22,6 +22,12 @@ serde.workspace = true
 serde_json.workspace = true
 zip.workspace = true
 chrono.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 
 # Backend d'entrées pour Wayland (lecture de /dev/input).
 [target.'cfg(target_os = "linux")'.dependencies]

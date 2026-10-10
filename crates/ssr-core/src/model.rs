@@ -36,6 +36,8 @@ pub enum Action {
     },
     /// Texte saisi au clavier (agrégé entre deux clics).
     Text { content: String },
+    /// A physical typing activity without verified committed text.
+    TextUnconfirmed,
 }
 
 /// Une étape de la session : une action, son contexte et sa capture éventuelle.
@@ -54,9 +56,72 @@ pub struct Step {
     pub screenshot: Option<String>,
     /// Description lisible de l'étape, façon MS PSR (dans la langue de la session).
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_source: Option<TextSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<VisualAnalysis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_screenshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_timestamp_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_timestamp_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSource {
+    KeyboardEstimate,
+    InputMethodCommit,
+    TextField,
+    AccessibleField,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualAnalysis {
+    pub status: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub visible_result: String,
+    #[serde(default)]
+    pub uncertainty: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub model: String,
 }
 
 impl Step {
+    /// One description selection path for GUI and report.
+    pub fn display_description(&self, lang: Lang) -> String {
+        if let Some(edit) = &self.edited_description {
+            return edit.clone();
+        }
+        if let Some(ai) = &self.analysis {
+            if ai.status == "complete" && !ai.description.trim().is_empty() {
+                return ai.description.clone();
+            }
+        }
+        if matches!(
+            self.text_source,
+            Some(TextSource::TextField | TextSource::AccessibleField)
+        ) {
+            if let Action::Text { content } = &self.action {
+                return format!(
+                    "{}：“{}”",
+                    lang.pick("Champ modifié", "Text field updated"),
+                    content.replace('\n', "⏎")
+                );
+            }
+        }
+        Self::build_description(&self.action, self.window.as_ref(), lang)
+    }
+
     /// Construit la description lisible à partir de l'action et du contexte,
     /// dans la langue donnée.
     pub fn build_description(action: &Action, window: Option<&WindowInfo>, lang: Lang) -> String {
@@ -71,14 +136,19 @@ impl Step {
             .unwrap_or_else(|| match lang {
                 Lang::Fr => "la fenêtre active".to_string(),
                 Lang::En => "the active window".to_string(),
+                Lang::ZhCn => "当前窗口".to_string(),
             });
 
         match action {
+            Action::TextUnconfirmed => lang
+                .pick("Saisie non confirmée", "Unconfirmed text input")
+                .to_string(),
             Action::Click { button, .. } => {
                 let b = button.label(lang);
                 match lang {
                     Lang::Fr => format!("Clic {b} sur {target}"),
                     Lang::En => format!("{} click on {target}", capitalize(&b)),
+                    Lang::ZhCn => format!("在{target}点击{b}"),
                 }
             }
             Action::Text { content } => {
@@ -86,6 +156,7 @@ impl Step {
                 match lang {
                     Lang::Fr => format!("Saisie « {shown} » dans {target}"),
                     Lang::En => format!("Typed “{shown}” in {target}"),
+                    Lang::ZhCn => format!("在{target}输入“{shown}”"),
                 }
             }
         }
