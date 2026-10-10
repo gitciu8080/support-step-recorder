@@ -31,11 +31,15 @@ pub struct Session {
     pending_input: bool,
     pending_field_change: bool,
     text_window: Option<WindowInfo>,
+    #[cfg(target_os = "linux")]
     text_context: String,
+    #[cfg(target_os = "linux")]
     field_value: Option<String>,
     pub shortcut_down: bool,
     pub screenshot_quality: f32,
+    #[cfg(target_os = "linux")]
     a11y_context: String,
+    #[cfg(target_os = "linux")]
     a11y_value: Option<String>,
 }
 
@@ -58,11 +62,15 @@ impl Session {
             pending_input: false,
             pending_field_change: false,
             text_window: None,
+            #[cfg(target_os = "linux")]
             text_context: String::new(),
+            #[cfg(target_os = "linux")]
             field_value: None,
             shortcut_down: false,
             screenshot_quality: 100.0,
+            #[cfg(target_os = "linux")]
             a11y_context: String::new(),
+            #[cfg(target_os = "linux")]
             a11y_value: None,
         })
     }

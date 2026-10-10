@@ -92,6 +92,9 @@ fn run(rx: Receiver<Job>, progress: Progress, lang: crate::i18n::Lang) {
 }
 
 fn write_job(job: Job) -> std::io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let Pixels::Rgba(image) = job.pixels;
+    #[cfg(target_os = "linux")]
     let image = match job.pixels {
         Pixels::Rgba(img) => img,
         #[cfg(target_os = "linux")]

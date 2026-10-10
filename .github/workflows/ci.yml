@@ -22,6 +22,8 @@ jobs:
       - name: Select stable Rust
         run: rustup default stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Check tag version
