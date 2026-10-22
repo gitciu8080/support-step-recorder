@@ -23,7 +23,7 @@ serde_json.workspace = true
 zip.workspace = true
 chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-base64 = "0.22"
+base64 = "0.23"
 
 [build-dependencies]
 cc = "1"
